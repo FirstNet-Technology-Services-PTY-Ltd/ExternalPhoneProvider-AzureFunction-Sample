@@ -15,6 +15,11 @@
       "id": "infobip",
       "displayName": "Infobip",
       "file": "infobip.json"
+    },
+    {
+      "id": "firstnet",
+      "displayName": "FirstNet",
+      "file": "firstnet.json"
     }
   ]
 }

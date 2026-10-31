@@ -1,0 +1,29 @@
+{
+  "deployment": {
+    "enabled": true,
+    "providerName": "FirstNet",
+    "tenantId": "c93e7b0b-6902-453f-9fc3-fae110c9efb3",
+    "AccessTokenScopeTenant": "c93e7b0b-6902-453f-9fc3-fae110c9efb3",
+    "authentication": {
+      "mode": "oauth"
+    },
+    "routes": {
+      "global": {
+        "smsEndpoint": "https://entra-otp.firstnet.co.za/v1/entra/otp",
+        "voiceEndpoint": "https://entra-otp.firstnet.co.za/v1/entra/otp",
+        "appId": "0b154203-5ab4-45b7-90a4-8d377a9b75df",
+        "scope": "api://0b154203-5ab4-45b7-90a4-8d377a9b75df/.default",
+        "timeoutMilliseconds": 1500,
+        "retryIntervalSeconds": 30
+      },
+      "eu": {
+        "smsEndpoint": "https://entra-otp.firstnet.co.za/v1/entra/otp",
+        "voiceEndpoint": "https://entra-otp.firstnet.co.za/v1/entra/otp",
+        "appId": "0b154203-5ab4-45b7-90a4-8d377a9b75df",
+        "scope": "api://0b154203-5ab4-45b7-90a4-8d377a9b75df/.default",
+        "timeoutMilliseconds": 1500,
+        "retryIntervalSeconds": 30
+      }
+    }
+  }
+}
