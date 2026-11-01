@@ -44,6 +44,9 @@ jobs:
       - name: Test deployment progress without Azure access
         shell: pwsh
         run: ./setup/tests/Progress.Tests.ps1
+      - name: Test FirstNet enablement logic without Azure access
+        shell: pwsh
+        run: ./setup/tests/FirstNet.Tests.ps1
       - name: Compile Bicep without deploying
         shell: pwsh
         run: |
