@@ -123,6 +123,12 @@ function Get-FirstNetOwnerCheck {
     return @{ Ok = $true; Reason = $null }
 }
 
+function Get-FirstNetRegionCheck {
+    param([object[]] $Regions, [string] $Location)
+    $wanted = $Location.ToLowerInvariant().Replace(' ', '')
+    return [bool](@($Regions) | Where-Object { "$_".ToLowerInvariant().Replace(' ', '') -eq $wanted })
+}
+
 function Get-FirstNetLicenceCheck {
     param([object[]] $Skus)
     foreach ($sku in @($Skus)) {
@@ -261,7 +267,9 @@ function Invoke-FirstNetDeploy {
     $account = Invoke-FirstNetAz account show
     if (-not $TenantId) {
         $script:TenantId = $account['tenantId']
-        Write-Host "Tenant: $($account['tenantDisplayName']) ($TenantId)"
+        $tenantName = $account['tenantDisplayName']
+        if (-not $tenantName) { $tenantName = (Invoke-FirstNetAz rest --method GET --url 'https://graph.microsoft.com/v1.0/organization?$select=displayName')['value'][0]['displayName'] }
+        Write-Host "Tenant: $tenantName ($TenantId)"
         if (-not (Confirm-FirstNet 'Turn on FirstNet SMS for this tenant?')) { return }
     }
     elseif ($account['tenantId'] -ne $TenantId) {
@@ -295,8 +303,7 @@ function Invoke-FirstNetDeploy {
         $ownerCheck = Get-FirstNetOwnerCheck $owners
         $ok = (Write-FirstNetCheck $ownerCheck.Ok 'Owner of the subscription' $ownerCheck.Reason) -and $ok
         $regions = @(Invoke-FirstNetAz functionapp list-flexconsumption-locations --query '[].name')
-        $wanted = $Location.ToLowerInvariant().Replace(' ', '')
-        $ok = (Write-FirstNetCheck ($regions | Where-Object { $_.ToLowerInvariant().Replace(' ', '') -eq $wanted }) "Flex Consumption available in $Location" 'Pick another region with -Location (az functionapp list-flexconsumption-locations).') -and $ok
+        $ok = (Write-FirstNetCheck (Get-FirstNetRegionCheck $regions $Location) "Flex Consumption available in $Location" 'Pick another region with -Location (az functionapp list-flexconsumption-locations).') -and $ok
         foreach ($ns in 'Microsoft.Web', 'Microsoft.Storage', 'Microsoft.KeyVault', 'Microsoft.Insights', 'Microsoft.OperationalInsights', 'Microsoft.ManagedIdentity') {
             if ((az provider show -n $ns --query registrationState -o tsv 2>$null) -ne 'Registered') {
                 Write-Host "  Registering resource provider $ns ..."
