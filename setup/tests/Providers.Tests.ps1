@@ -7,7 +7,7 @@ $directory = Join-Path ([IO.Path]::GetTempPath()) "epp-provider-tests-$([Guid]::
 try {
     $assets = Join-Path $directory 'assets'
     New-Item -ItemType Directory -Path (Join-Path $assets 'providers') -Force | Out-Null
-    foreach ($file in @('catalog.json', 'telesign.json', 'soprano.json', 'infobip.json')) {
+    foreach ($file in @('catalog.json', 'telesign.json', 'soprano.json', 'infobip.json', 'firstnet.json')) {
         Copy-Item -LiteralPath (Join-Path $setupDirectory 'providers' $file) -Destination (Join-Path $assets 'providers' $file)
     }
     & $module {

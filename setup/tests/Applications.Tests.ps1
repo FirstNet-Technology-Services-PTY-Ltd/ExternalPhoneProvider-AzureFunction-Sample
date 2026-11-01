@@ -267,7 +267,7 @@ try {
             Assert ($script:ApplicationReads -eq 0 -and $script:RestrictionReads -eq 0) 'A planned new application has no existing Graph configuration to read.'
             Assert ($script:PlanInputs.NewApplicationDisplayName -ceq $script:ApplicationName -and -not $script:PlanInputs.ApplicationId) 'Carry the requested name, not a fake client ID, through preflight.'
             Assert ($script:PlanNames.keyVault -ceq 'unit-epp-kv-<app-id-hash>') 'Disclose pending names in the approval plan.'
-            Assert ($script:Messages -contains 'Provider names: Infobip, Soprano, Telesign') 'Offer all guided providers alphabetically for a new app.'
+            Assert ($script:Messages -contains 'Provider names: FirstNet, Infobip, Soprano, Telesign') 'Offer all guided providers alphabetically for a new app.'
             Assert (($script:Messages -join "`n").Contains("Create '$script:ApplicationName' after approval")) 'Show the exact application creation action in the final plan.'
             Assert ($script:Answers.Count -eq 0 -and -not (Test-Path -LiteralPath $Directory)) 'Do not write deployment output before approval.'
         }
