@@ -11,7 +11,7 @@ $state = @{
 $requiredAssets = @(
     'support/Epp.Setup.psm1', 'support/Epp.Packages.ps1', 'support/Epp.Graph.ps1'
     'providers/catalog.json', 'packages/catalog.json', 'infra/main.bicep', 'infra/resources.bicep'
-    'providers/telesign.json', 'providers/soprano.json', 'providers/infobip.json'
+    'providers/telesign.json', 'providers/soprano.json', 'providers/infobip.json', 'providers/firstnet.json'
 )
 
 function Assert($Condition, [string] $Message) {
