@@ -39,6 +39,10 @@ Assert (-not $o.Ok -and $o.Reason -match 'assign all roles') 'a constrained Owne
 Assert (Get-FirstNetOwnerCheck @(@{ condition = 'x' }, @{ condition = $null })).Ok 'one unconstrained Owner is enough'
 Assert (Get-FirstNetLicenceCheck @(@{ capabilityStatus = 'Enabled'; servicePlans = @(@{ servicePlanName = 'EXCHANGE_S_STANDARD'; provisioningStatus = 'Success' }, @{ servicePlanName = 'AAD_PREMIUM'; provisioningStatus = 'Success' }) })) 'P1 inside a suite counts'
 Assert (-not (Get-FirstNetLicenceCheck @(@{ capabilityStatus = 'Suspended'; servicePlans = @(@{ servicePlanName = 'AAD_PREMIUM_P2'; provisioningStatus = 'Success' }) }))) 'a suspended SKU does not count'
+Assert (Get-FirstNetRegionCheck @('East US', 'South Africa North') 'southafricanorth') 'region names match without spaces or case'
+Assert (Get-FirstNetRegionCheck @('southafricanorth') 'southafricanorth') 'region matches as one value (1 Nov live run: a string reached [bool])'
+Assert (-not (Get-FirstNetRegionCheck @('eastus') 'southafricanorth')) 'missing region fails'
+Assert (-not (Get-FirstNetRegionCheck @() 'southafricanorth')) 'no regions fails'
 
 # --- activation: SMS off -> pilot group only
 $off = @{ state = 'disabled'; includeTargets = @(@{ targetType = 'group'; id = 'all_users'; isRegistrationRequired = $false; isUsableForSignIn = $true }); telecomProviderSettings = $null }
