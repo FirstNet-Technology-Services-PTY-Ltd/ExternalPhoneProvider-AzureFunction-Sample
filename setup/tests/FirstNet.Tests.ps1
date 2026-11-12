@@ -58,6 +58,7 @@ Assert-Throws { Get-FirstNetActivation -Current $inUse -AppId $app -EndpointUrl 
 $a = Get-FirstNetActivation -Current $inUse -AppId $app -EndpointUrl $url -Percent 5
 Assert ($a.Mode -eq 'existing-targets' -and -not $a.Body.ContainsKey('includeTargets') -and -not $a.Body.ContainsKey('state')) 'existing targets untouched'
 Assert ($a.Body.telecomProviderSettings.migrationPercentage -eq 5) '5% through FirstNet'
+Assert ($a.Summary -match '1 February 2027.*100%') 'the plan tells them to reach 100% before Microsoft retires its SMS'
 
 # --- another provider already configured: refuse
 $other = @{ state = 'enabled'; includeTargets = @(@{ targetType = 'group'; id = $group }); telecomProviderSettings = @{ url = 'https://other.example/api/SendOtp'; appId = $app } }

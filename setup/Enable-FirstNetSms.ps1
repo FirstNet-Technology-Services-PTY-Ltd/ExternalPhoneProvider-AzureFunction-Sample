@@ -23,6 +23,8 @@
     Share of SMS sign-ins routed to FirstNet (migrationPercentage). With -Activate it is required only when SMS is
     already in use in the tenant: the script then keeps the existing SMS users and routes this share to FirstNet,
     instead of narrowing SMS to the pilot group (which would switch SMS off for everyone else).
+    Set it to 100 well before 1 February 2027, when Microsoft retires its own SMS codes: sign-ins not routed through
+    FirstNet don't fall back to it.
 #>
 [CmdletBinding(DefaultParameterSetName = 'Deploy')]
 param(
@@ -168,7 +170,7 @@ function Get-FirstNetActivation {
         throw "SMS sign-in is already in use here ($who). Narrowing it to a pilot group would switch SMS off for everyone else, so this script keeps those users and routes a share of their SMS sign-ins to FirstNet instead. Rerun with -Percent (for example -Percent 5)."
     }
     $provider.migrationPercentage = $Percent
-    return @{ Body = $body; Mode = 'existing-targets'; Summary = "SMS users unchanged; $Percent% of SMS sign-ins go through FirstNet, the rest through Microsoft until Microsoft stops sending SMS." }
+    return @{ Body = $body; Mode = 'existing-targets'; Summary = "SMS users unchanged; $Percent% of SMS sign-ins go through FirstNet, the rest through Microsoft's own SMS, which it retires on 1 February 2027. Widen to 100% before then." }
 }
 
 function Get-FirstNetExpansion {
@@ -397,6 +399,11 @@ function Invoke-FirstNetActivate {
     Set-FirstNetSmsPolicy $change.Body
     Write-Host "`nNext: make sure pilot users have a mobile number registered (or a Conditional Access policy requiring MFA for the group), sign in, and tell FirstNet the time. FirstNet sees each SMS in its console." -ForegroundColor Green
     Write-Host 'Widen later with: ./Enable-FirstNetSms.ps1 -Expand -Percent 100 [-AllUsers]'
+    if ($change.Body.telecomProviderSettings.migrationPercentage -lt 100) { Write-FirstNetRetirementNote }
+}
+
+function Write-FirstNetRetirementNote {
+    Write-Host 'Reach 100% well before 1 February 2027, when Microsoft retires its own SMS codes: sign-ins not routed through FirstNet don''t fall back to it.' -ForegroundColor Yellow
 }
 
 function Invoke-FirstNetExpand {
@@ -410,6 +417,7 @@ function Invoke-FirstNetExpand {
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
     Save-FirstNetSmsPolicyBackup $current | Out-Null
     Set-FirstNetSmsPolicy $body
+    if ($body.telecomProviderSettings.migrationPercentage -lt 100) { Write-FirstNetRetirementNote }
 }
 
 function Invoke-FirstNetRollback {
