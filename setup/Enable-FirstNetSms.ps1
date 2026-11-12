@@ -1,7 +1,8 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Turn on FirstNet SMS MFA (Microsoft Entra ID external phone provider) in your tenant.
+    Turn on FirstNet SMS MFA, and optionally voice call MFA (Microsoft Entra ID external phone provider), in your
+    tenant.
 .DESCRIPTION
     Run in Azure Cloud Shell (PowerShell) as your tenant's administrator. Four steps, each a separate run:
 
@@ -13,18 +14,31 @@
       ./Enable-FirstNetSms.ps1 -Expand -Percent 100 [-AllUsers]
                                                Widen the rollout.
       ./Enable-FirstNetSms.ps1 -Rollback <backup.json>
-                                               Put the SMS policy back exactly as it was.
+                                               Put the policy saved in that backup back exactly as it was.
+
+    Add -Channel Voice (or -Channel Both) to -Activate and -Expand to do the same for voice calls. The same Function
+    serves both channels, so voice needs no second deployment or setup code:
+
+      ./Enable-FirstNetSms.ps1 -Activate -Channel Voice [-Evaluate]
+      ./Enable-FirstNetSms.ps1 -Expand -Channel Voice -Percent 100 [-AllUsers]
 
     ./Enable-FirstNetSms.ps1 -SetupCode prints the setup code again.
 
     Nothing here needs FirstNet to have access to your tenant. The setup code holds identifiers only (tenant ID,
     endpoint application ID, Function URL, organisation name and your contact address), no secrets.
+.PARAMETER Channel
+    Which authentication method policy -Activate and -Expand change: Sms (the default, as before), Voice (the voice
+    call policy) or Both. Each channel is backed up to its own file (sms-policy-backup-*.json,
+    voice-policy-backup-*.json), and -Rollback reads the channel from the backup, so it needs no -Channel.
+    With Both, both channels use the same pilot group and -Percent. The voice policy's office phone setting
+    (isOfficePhoneAllowed) is left as it is. Voice calls through FirstNet need FirstNet to have switched voice on for
+    your organisation; -Evaluate tests the voice path without that, because Microsoft still makes the call.
 .PARAMETER Percent
-    Share of SMS sign-ins routed to FirstNet (migrationPercentage). With -Activate it is required only when SMS is
-    already in use in the tenant: the script then keeps the existing SMS users and routes this share to FirstNet,
-    instead of narrowing SMS to the pilot group (which would switch SMS off for everyone else).
-    Set it to 100 well before 1 February 2027, when Microsoft retires its own SMS codes: sign-ins not routed through
-    FirstNet don't fall back to it.
+    Share of the channel's sign-ins routed to FirstNet (migrationPercentage). With -Activate it is required only when
+    the channel is already in use in the tenant: the script then keeps the existing users and routes this share to
+    FirstNet, instead of narrowing the channel to the pilot group (which would switch it off for everyone else).
+    Set it to 100 well before 1 February 2027, when Microsoft retires its own SMS codes and voice calls: sign-ins
+    not routed through FirstNet don't fall back to it.
 #>
 [CmdletBinding(DefaultParameterSetName = 'Deploy')]
 param(
@@ -49,6 +63,10 @@ param(
     [Parameter(ParameterSetName = 'Expand')]
     [ValidateRange(1, 100)] [int] $Percent,
 
+    [Parameter(ParameterSetName = 'Activate')]
+    [Parameter(ParameterSetName = 'Expand')]
+    [ValidateSet('Sms', 'Voice', 'Both')] [string] $Channel = 'Sms',
+
     [Parameter(ParameterSetName = 'Rollback', Mandatory)] [string] $Rollback,
 
     [string] $OutputDirectory = (Join-Path $HOME 'firstnet-sms'),
@@ -59,7 +77,20 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$script:SmsPolicyUri = 'https://graph.microsoft.com/beta/policies/authenticationMethodsPolicy/authenticationMethodConfigurations/Sms'
+$script:PolicyBaseUri = 'https://graph.microsoft.com/beta/policies/authenticationMethodsPolicy/authenticationMethodConfigurations'
+# One entry per authentication method policy this script can route through FirstNet (both take telecomProviderSettings).
+$script:FirstNetChannels = @{
+    Sms = @{
+        Label = 'SMS'; Noun = 'SMS'; Own = 'SMS'; MicrosoftSends = 'Microsoft sends SMS'
+        Uri = "$script:PolicyBaseUri/Sms"; ODataType = '#microsoft.graph.smsAuthenticationMethodConfiguration'
+        BackupPrefix = 'sms-policy-backup'; Flag = ''
+    }
+    Voice = @{
+        Label = 'Voice'; Noun = 'voice'; Own = 'voice calls'; MicrosoftSends = 'Microsoft makes voice calls'
+        Uri = "$script:PolicyBaseUri/voice"; ODataType = '#microsoft.graph.voiceAuthenticationMethodConfiguration'
+        BackupPrefix = 'voice-policy-backup'; Flag = ' -Channel Voice'
+    }
+}
 $script:SetupCodePrefix = 'FNSMS1.'
 $script:ProviderId = 'firstnet'
 
@@ -142,52 +173,86 @@ function Get-FirstNetLicenceCheck {
     return $false
 }
 
+function Get-FirstNetChannels {
+    <# The policies a -Channel value covers, SMS first. #>
+    param([ValidateSet('Sms', 'Voice', 'Both')] [string] $Channel = 'Sms')
+    if ($Channel -eq 'Both') { return @('Sms', 'Voice') }
+    return @($Channel)
+}
+
+function Test-FirstNetPolicyInUse {
+    param([Parameter(Mandatory)] [hashtable] $Current)
+    return $Current['state'] -eq 'enabled' -and @($Current['includeTargets'] | Where-Object { $_ }).Count -gt 0
+}
+
+function New-FirstNetTarget {
+    <# An includeTargets entry. isUsableForSignIn exists only on SMS targets (SMS sign-in); voice targets don't have it. #>
+    param([Parameter(Mandatory)] [string] $Channel, [Parameter(Mandatory)] [string] $Id)
+    $target = @{ targetType = 'group'; id = $Id; isRegistrationRequired = $false }
+    if ($Channel -eq 'Sms') { $target.isUsableForSignIn = $true }
+    return $target
+}
+
 function Get-FirstNetActivation {
     <#
-    Works out the SMS policy change for -Activate from the current policy. Returns @{ Body; Mode; Summary }.
-      pilot-group       SMS was off (or had no targets): enable SMS for the pilot group only, 100% through FirstNet.
-      existing-targets  SMS is already in use: keep its targets and route -Percent of SMS sign-ins through FirstNet.
+    Works out one channel's policy change for -Activate from its current policy. Returns @{ Body; Mode; Summary }.
+      pilot-group       The channel was off (or had no targets): enable it for the pilot group only, 100% through FirstNet.
+      existing-targets  The channel is already in use: keep its targets and route -Percent of its sign-ins through FirstNet.
     #>
     param([Parameter(Mandatory)] [hashtable] $Current, [Parameter(Mandatory)] [string] $AppId,
-          [Parameter(Mandatory)] [string] $EndpointUrl, [string] $GroupId, [int] $Percent, [switch] $Evaluate)
+          [Parameter(Mandatory)] [string] $EndpointUrl, [string] $GroupId, [int] $Percent, [switch] $Evaluate,
+          [ValidateSet('Sms', 'Voice')] [string] $Channel = 'Sms')
+    $c = $script:FirstNetChannels[$Channel]
     $existing = $Current['telecomProviderSettings']
     if ($existing -and $existing['url'] -and ($existing['url'] -ne $EndpointUrl -or $existing['appId'] -ne $AppId)) {
-        throw "SMS is already routed to another provider ($($existing['url'])). Roll that back first; nothing was changed."
+        throw "$($c.Label) is already routed to another provider ($($existing['url'])). Roll that back first; nothing was changed."
     }
     $targets = @($Current['includeTargets'] | Where-Object { $_ })
-    $inUse = $Current['state'] -eq 'enabled' -and $targets.Count -gt 0
     $provider = @{ url = $EndpointUrl; appId = $AppId; isEvaluationModeEnabled = [bool]$Evaluate; migrationPercentage = 100 }
-    $body = @{ '@odata.type' = '#microsoft.graph.smsAuthenticationMethodConfiguration'; telecomProviderSettings = $provider }
-    if (-not $inUse) {
+    $body = @{ '@odata.type' = $c.ODataType; telecomProviderSettings = $provider }
+    if (-not (Test-FirstNetPolicyInUse $Current)) {
         if (-not $GroupId) { throw 'A pilot group ID is required.' }
         if ($Percent) { $provider.migrationPercentage = $Percent }
         $body.state = 'enabled'
-        $body.includeTargets = @(@{ targetType = 'group'; id = $GroupId; isRegistrationRequired = $false; isUsableForSignIn = $true })
-        return @{ Body = $body; Mode = 'pilot-group'; Summary = "SMS enabled for the pilot group only; $($provider.migrationPercentage)% of its SMS sign-ins go through FirstNet." }
+        $body.includeTargets = @(New-FirstNetTarget $Channel $GroupId)
+        return @{ Body = $body; Mode = 'pilot-group'; Summary = "$($c.Label) enabled for the pilot group only; $($provider.migrationPercentage)% of its $($c.Noun) sign-ins go through FirstNet." }
     }
     if (-not $Percent) {
         $who = ($targets | ForEach-Object { if ($_['targetType'] -eq 'group' -and $_['id'] -eq 'all_users') { 'all users' } else { "$($_['targetType']) $($_['id'])" } }) -join ', '
-        throw "SMS sign-in is already in use here ($who). Narrowing it to a pilot group would switch SMS off for everyone else, so this script keeps those users and routes a share of their SMS sign-ins to FirstNet instead. Rerun with -Percent (for example -Percent 5)."
+        throw "$($c.Label) sign-in is already in use here ($who). Narrowing it to a pilot group would switch $($c.Noun) off for everyone else, so this script keeps those users and routes a share of their $($c.Noun) sign-ins to FirstNet instead. Rerun with -Percent (for example -Percent 5)."
     }
     $provider.migrationPercentage = $Percent
-    return @{ Body = $body; Mode = 'existing-targets'; Summary = "SMS users unchanged; $Percent% of SMS sign-ins go through FirstNet, the rest through Microsoft's own SMS, which it retires on 1 February 2027. Widen to 100% before then." }
+    return @{ Body = $body; Mode = 'existing-targets'; Summary = "$($c.Label) users unchanged; $Percent% of $($c.Noun) sign-ins go through FirstNet, the rest through Microsoft's own $($c.Own), which it retires on 1 February 2027. Widen to 100% before then." }
 }
 
 function Get-FirstNetExpansion {
-    param([Parameter(Mandatory)] [hashtable] $Current, [int] $Percent, [switch] $AllUsers)
+    param([Parameter(Mandatory)] [hashtable] $Current, [int] $Percent, [switch] $AllUsers,
+          [ValidateSet('Sms', 'Voice')] [string] $Channel = 'Sms')
+    $c = $script:FirstNetChannels[$Channel]
     $provider = $Current['telecomProviderSettings']
-    if (-not $provider -or -not $provider['url']) { throw 'FirstNet is not active yet. Run -Activate first.' }
+    if (-not $provider -or -not $provider['url']) { throw "FirstNet is not active for $($c.Noun) yet. Run -Activate$($c.Flag) first." }
     if (-not $Percent -and -not $AllUsers) { throw 'Say what to widen: -Percent <1-100>, -AllUsers, or both.' }
     $settings = @{
         url = $provider['url']; appId = $provider['appId']; isEvaluationModeEnabled = $false
         migrationPercentage = $(if ($Percent) { $Percent } else { [int]$provider['migrationPercentage'] })
     }
-    $body = @{ '@odata.type' = '#microsoft.graph.smsAuthenticationMethodConfiguration'; telecomProviderSettings = $settings }
+    $body = @{ '@odata.type' = $c.ODataType; telecomProviderSettings = $settings }
     if ($AllUsers) {
         $body.state = 'enabled'
-        $body.includeTargets = @(@{ targetType = 'group'; id = 'all_users'; isRegistrationRequired = $false; isUsableForSignIn = $true })
+        $body.includeTargets = @(New-FirstNetTarget $Channel 'all_users')
     }
     return $body
+}
+
+function Get-FirstNetBackupChannel {
+    <# Which policy a backup holds: from its @odata.type or id. Backups made before -Channel existed are SMS. #>
+    param([Parameter(Mandatory)] [hashtable] $Backup)
+    $type = [string]$Backup['@odata.type']
+    if ($type -match 'voiceAuthenticationMethodConfiguration$' -or (-not $type -and $Backup['id'] -eq 'Voice')) { return 'Voice' }
+    if ($type -and $type -notmatch 'smsAuthenticationMethodConfiguration$') {
+        throw "This backup is not an SMS or voice policy ($type). Nothing was changed."
+    }
+    return 'Sms'
 }
 
 function Get-FirstNetRollbackBody {
@@ -199,7 +264,7 @@ function Get-FirstNetRollbackBody {
         $item
     })
     return @{
-        '@odata.type' = '#microsoft.graph.smsAuthenticationMethodConfiguration'
+        '@odata.type' = $script:FirstNetChannels[(Get-FirstNetBackupChannel $Backup)].ODataType
         state = $Backup['state']
         includeTargets = $targets
         telecomProviderSettings = $Backup['telecomProviderSettings']
@@ -233,28 +298,31 @@ function Connect-FirstNetGraph {
     }
 }
 
-function Get-FirstNetSmsPolicy {
-    return (Invoke-MgGraphRequest -Method GET -Uri $script:SmsPolicyUri -OutputType Json) | ConvertFrom-Json -AsHashtable
+function Get-FirstNetPolicy {
+    param([string] $Channel = 'Sms')
+    return (Invoke-MgGraphRequest -Method GET -Uri $script:FirstNetChannels[$Channel].Uri -OutputType Json) | ConvertFrom-Json -AsHashtable
 }
 
-function Save-FirstNetSmsPolicyBackup {
-    param([hashtable] $Policy)
-    $path = Join-Path $OutputDirectory "sms-policy-backup-$([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')).json"
+function Save-FirstNetPolicyBackup {
+    param([string] $Channel = 'Sms', [hashtable] $Policy)
+    $c = $script:FirstNetChannels[$Channel]
+    $path = Join-Path $OutputDirectory "$($c.BackupPrefix)-$([DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')).json"
     $Policy | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $path -Encoding utf8NoBOM
-    Write-Host "SMS policy backup: $path" -ForegroundColor Cyan
+    Write-Host "$($c.Label) policy backup: $path" -ForegroundColor Cyan
     Write-Host '  Keep a copy outside Cloud Shell (Manage files > Download). To undo later:'
     Write-Host "  ./Enable-FirstNetSms.ps1 -Rollback '$path'"
     return $path
 }
 
-function Set-FirstNetSmsPolicy {
-    param([hashtable] $Body)
-    Invoke-MgGraphRequest -Method PATCH -Uri $script:SmsPolicyUri -Body ($Body | ConvertTo-Json -Depth 10) -ContentType 'application/json' | Out-Null
-    $after = Get-FirstNetSmsPolicy
+function Set-FirstNetPolicy {
+    param([string] $Channel = 'Sms', [hashtable] $Body)
+    $c = $script:FirstNetChannels[$Channel]
+    Invoke-MgGraphRequest -Method PATCH -Uri $c.Uri -Body ($Body | ConvertTo-Json -Depth 10) -ContentType 'application/json' | Out-Null
+    $after = Get-FirstNetPolicy $Channel
     $p = $after['telecomProviderSettings']
-    Write-Host "`nSMS policy now: state $($after['state']); targets $((@($after['includeTargets'] | ForEach-Object { $_['id'] }) -join ', '))"
+    Write-Host "`n$($c.Label) policy now: state $($after['state']); targets $((@($after['includeTargets'] | ForEach-Object { $_['id'] }) -join ', '))"
     if ($p) { Write-Host "  provider $($p['url']); evaluation $($p['isEvaluationModeEnabled']); $($p['migrationPercentage'])%" }
-    else { Write-Host '  no external provider (Microsoft sends SMS)' }
+    else { Write-Host "  no external provider ($($c.MicrosoftSends))" }
     Write-Host 'Changes can take a few minutes (Microsoft says up to an hour) to reach sign-ins.'
 }
 
@@ -295,7 +363,7 @@ function Invoke-FirstNetDeploy {
         Write-Host "`nChecking prerequisites" -ForegroundColor Cyan
         $ok = $true
         $skus = (Invoke-FirstNetAz rest --method GET --url 'https://graph.microsoft.com/v1.0/subscribedSkus?$select=skuPartNumber,capabilityStatus,servicePlans')['value']
-        $ok = (Write-FirstNetCheck (Get-FirstNetLicenceCheck $skus) 'Microsoft Entra ID P1 or P2' 'Users who get SMS MFA through FirstNet need Entra ID P1 or P2.') -and $ok
+        $ok = (Write-FirstNetCheck (Get-FirstNetLicenceCheck $skus) 'Microsoft Entra ID P1 or P2' 'Users who get SMS or voice MFA through FirstNet need Entra ID P1 or P2.') -and $ok
         $roles = @((Invoke-FirstNetAz rest --method GET --url 'https://graph.microsoft.com/v1.0/me/memberOf/microsoft.graph.directoryRole?$select=displayName')['value'] | ForEach-Object { $_['displayName'] })
         $roleCheck = Get-FirstNetRoleCheck $roles
         $ok = (Write-FirstNetCheck $roleCheck.Ok 'Directory roles' "Missing: $($roleCheck.Missing -join '; '). If you use PIM, activate the roles first.") -and $ok
@@ -364,14 +432,18 @@ function Show-FirstNetSetupCode {
 function Invoke-FirstNetActivate {
     $deployment = Get-FirstNetLatestFile $OutputDirectory 'deployment-*.json' $null
     if (-not $deployment) { throw "No FirstNet deployment found in $OutputDirectory. Run ./Enable-FirstNetSms.ps1 first." }
+    $channels = @(Get-FirstNetChannels $Channel)
     if (-not (Confirm-FirstNet 'Has FirstNet confirmed that your setup code is approved?')) {
-        Write-Host 'Wait for FirstNet''s confirmation first: until then FirstNet would refuse your sign-ins'' SMS.'; return
+        Write-Host "Wait for FirstNet's confirmation first: until then FirstNet would refuse your sign-ins' $(if ($channels -contains 'Sms') { 'SMS' } else { 'voice calls' })."; return
+    }
+    if ($channels -contains 'Voice' -and -not $Evaluate -and -not (Confirm-FirstNet 'Has FirstNet confirmed that voice calls are switched on for your organisation?')) {
+        Write-Host 'Ask FirstNet to switch voice on first: until then FirstNet would refuse your sign-ins'' voice calls. -Evaluate tests voice without it.'; return
     }
     Connect-FirstNetGraph $deployment.tenantId
-    $current = Get-FirstNetSmsPolicy
+    $current = @{}
+    foreach ($ch in $channels) { $current[$ch] = Get-FirstNetPolicy $ch }
     $groupId = $null
-    $inUse = $current['state'] -eq 'enabled' -and @($current['includeTargets'] | Where-Object { $_ }).Count -gt 0
-    if (-not $inUse) {
+    if (@($channels | Where-Object { -not (Test-FirstNetPolicyInUse $current[$_]) })) {
         $groupId = (az ad group show --group $PilotGroup --query id -o tsv 2>$null)
         if (-not $groupId) {
             Write-Host "Creating security group $PilotGroup"
@@ -389,46 +461,65 @@ function Invoke-FirstNetActivate {
         if (-not $members) { throw "The pilot group $PilotGroup has no members. Add one or two test users (-PilotUsers user@yourdomain) and rerun." }
         Write-Host "Pilot group $PilotGroup ($groupId): $($members -join ', ')"
     }
-    $change = Get-FirstNetActivation -Current $current -AppId $deployment.applicationId -EndpointUrl $deployment.endpointUrl `
-        -GroupId $groupId -Percent $Percent -Evaluate:$Evaluate
-    Write-Host "`nPlan: $($change.Summary)" -ForegroundColor Cyan
-    if ($Evaluate) { Write-Host 'Evaluation mode: Microsoft still sends the SMS. In new tenants Microsoft''s own SMS may be blocked (error 399287).' -ForegroundColor Yellow }
-    if (-not (Confirm-FirstNet 'Apply this change?')) { return }
+    # Work out every channel's change before touching any, so a refusal leaves both policies as they are.
+    $changes = [ordered]@{}
+    foreach ($ch in $channels) {
+        $changes[$ch] = Get-FirstNetActivation -Channel $ch -Current $current[$ch] -AppId $deployment.applicationId `
+            -EndpointUrl $deployment.endpointUrl -GroupId $groupId -Percent $Percent -Evaluate:$Evaluate
+        Write-Host "`nPlan: $($changes[$ch].Summary)" -ForegroundColor Cyan
+    }
+    if ($Evaluate -and $channels -contains 'Sms') { Write-Host 'Evaluation mode: Microsoft still sends the SMS. In new tenants Microsoft''s own SMS may be blocked (error 399287).' -ForegroundColor Yellow }
+    if ($Evaluate -and $channels -contains 'Voice') { Write-Host 'Evaluation mode: Microsoft still makes the voice call.' -ForegroundColor Yellow }
+    if (-not (Confirm-FirstNet $(if ($channels.Count -gt 1) { 'Apply these changes?' } else { 'Apply this change?' }))) { return }
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-    Save-FirstNetSmsPolicyBackup $current | Out-Null
-    Set-FirstNetSmsPolicy $change.Body
-    Write-Host "`nNext: make sure pilot users have a mobile number registered (or a Conditional Access policy requiring MFA for the group), sign in, and tell FirstNet the time. FirstNet sees each SMS in its console." -ForegroundColor Green
-    Write-Host 'Widen later with: ./Enable-FirstNetSms.ps1 -Expand -Percent 100 [-AllUsers]'
-    if ($change.Body.telecomProviderSettings.migrationPercentage -lt 100) { Write-FirstNetRetirementNote }
+    foreach ($ch in $channels) { Save-FirstNetPolicyBackup $ch $current[$ch] | Out-Null }
+    foreach ($ch in $channels) { Set-FirstNetPolicy $ch $changes[$ch].Body }
+    $seen = @($(if ($channels -contains 'Sms') { 'SMS' }), $(if ($channels -contains 'Voice') { 'call' })) -join ' and '
+    Write-Host "`nNext: make sure pilot users have a mobile number registered (or a Conditional Access policy requiring MFA for the group), sign in, and tell FirstNet the time. FirstNet sees each $seen in its console." -ForegroundColor Green
+    Write-Host "Widen later with: ./Enable-FirstNetSms.ps1 -Expand$(if ($Channel -ne 'Sms') { " -Channel $Channel" }) -Percent 100 [-AllUsers]"
+    foreach ($ch in $channels) { if ($changes[$ch].Body.telecomProviderSettings.migrationPercentage -lt 100) { Write-FirstNetRetirementNote $ch } }
 }
 
 function Write-FirstNetRetirementNote {
-    Write-Host 'Reach 100% well before 1 February 2027, when Microsoft retires its own SMS codes: sign-ins not routed through FirstNet don''t fall back to it.' -ForegroundColor Yellow
+    param([string] $Channel = 'Sms')
+    $text = if ($Channel -eq 'Voice') { 'Reach 100% for voice well before 1 February 2027, when Microsoft retires its own voice calls' }
+            else { 'Reach 100% well before 1 February 2027, when Microsoft retires its own SMS codes' }
+    Write-Host "$($text): sign-ins not routed through FirstNet don't fall back to it." -ForegroundColor Yellow
 }
 
 function Invoke-FirstNetExpand {
     $deployment = Get-FirstNetLatestFile $OutputDirectory 'deployment-*.json' $null
     if (-not $deployment) { throw "No FirstNet deployment found in $OutputDirectory." }
+    $channels = @(Get-FirstNetChannels $Channel)
     Connect-FirstNetGraph $deployment.tenantId
-    $current = Get-FirstNetSmsPolicy
-    $body = Get-FirstNetExpansion -Current $current -Percent $Percent -AllUsers:$AllUsers
-    $what = @($(if ($AllUsers) { 'SMS for all users' }), $(if ($Percent) { "$Percent% through FirstNet" })) -join ', '
-    if (-not (Confirm-FirstNet "Change the SMS policy: $what?")) { return }
+    $current = @{}; $bodies = [ordered]@{}
+    foreach ($ch in $channels) {
+        $current[$ch] = Get-FirstNetPolicy $ch
+        $bodies[$ch] = Get-FirstNetExpansion -Channel $ch -Current $current[$ch] -Percent $Percent -AllUsers:$AllUsers
+    }
+    $names = @($channels | ForEach-Object { $script:FirstNetChannels[$_].Noun }) -join ' and '
+    $policies = if ($channels.Count -gt 1) { "the $names policies" } else { "the $names policy" }
+    $what = @($(if ($AllUsers) { "$names for all users" }), $(if ($Percent) { "$Percent% through FirstNet" })) -join ', '
+    if (-not (Confirm-FirstNet "Change $($policies): $what?")) { return }
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-    Save-FirstNetSmsPolicyBackup $current | Out-Null
-    Set-FirstNetSmsPolicy $body
-    if ($body.telecomProviderSettings.migrationPercentage -lt 100) { Write-FirstNetRetirementNote }
+    foreach ($ch in $channels) { Save-FirstNetPolicyBackup $ch $current[$ch] | Out-Null }
+    foreach ($ch in $channels) {
+        Set-FirstNetPolicy $ch $bodies[$ch]
+        if ($bodies[$ch].telecomProviderSettings.migrationPercentage -lt 100) { Write-FirstNetRetirementNote $ch }
+    }
 }
 
 function Invoke-FirstNetRollback {
     $backup = Get-Content -LiteralPath $Rollback -Raw | ConvertFrom-Json -AsHashtable
+    $ch = Get-FirstNetBackupChannel $backup
+    $c = $script:FirstNetChannels[$ch]
     $deployment = Get-FirstNetLatestFile $OutputDirectory 'deployment-*.json' $null
     $tenant = if ($deployment) { $deployment.tenantId } else { Read-Host 'Tenant ID' }
     Connect-FirstNetGraph $tenant
     $body = Get-FirstNetRollbackBody $backup
-    $provider = if ($body.telecomProviderSettings) { $body.telecomProviderSettings['url'] } else { 'none (Microsoft sends SMS)' }
-    if (-not (Confirm-FirstNet "Restore the SMS policy to: state $($body.state), provider $provider?")) { return }
-    Set-FirstNetSmsPolicy $body
+    $provider = if ($body.telecomProviderSettings) { $body.telecomProviderSettings['url'] } else { "none ($($c.MicrosoftSends))" }
+    if (-not (Confirm-FirstNet "Restore the $($c.Noun) policy to: state $($body.state), provider $($provider)?")) { return }
+    Set-FirstNetPolicy $ch $body
 }
 
 # Dot-sourcing (tests) loads the functions only.

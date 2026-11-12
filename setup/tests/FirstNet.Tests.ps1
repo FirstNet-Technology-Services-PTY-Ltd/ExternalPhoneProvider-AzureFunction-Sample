@@ -84,5 +84,51 @@ $backup = @{
 $rb = Get-FirstNetRollbackBody $backup
 Assert ($rb.state -eq 'disabled' -and $null -eq $rb.telecomProviderSettings) 'state and provider restored'
 Assert ($rb.includeTargets[0].Keys.Count -eq 4 -and -not $rb.ContainsKey('id')) 'only writable target fields'
+Assert ($rb.'@odata.type' -eq '#microsoft.graph.smsAuthenticationMethodConfiguration' -and (Get-FirstNetBackupChannel $backup) -eq 'Sms') 'a backup from before -Channel restores the SMS policy'
+
+# --- channels: SMS stays the default everywhere
+$smsType = '#microsoft.graph.smsAuthenticationMethodConfiguration'
+$voiceType = '#microsoft.graph.voiceAuthenticationMethodConfiguration'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '..' 'Enable-FirstNetSms.ps1'), [ref] $null, [ref] $null)
+$channelParam = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Channel' }
+Assert ($channelParam -and $channelParam.DefaultValue.Value -eq 'Sms') '-Channel defaults to Sms'
+Assert ((@(Get-FirstNetChannels) -join ',') -eq 'Sms' -and (@(Get-FirstNetChannels 'Sms') -join ',') -eq 'Sms') 'the default is SMS only'
+Assert ((@(Get-FirstNetChannels 'Voice') -join ',') -eq 'Voice') 'Voice is voice only'
+Assert ((@(Get-FirstNetChannels 'Both') -join ',') -eq 'Sms,Voice') 'Both is SMS then voice'
+Assert ($script:FirstNetChannels.Sms.Uri -cmatch '/beta/policies/authenticationMethodsPolicy/authenticationMethodConfigurations/Sms$') 'SMS policy URI unchanged'
+Assert ($script:FirstNetChannels.Voice.Uri -cmatch '/beta/policies/authenticationMethodsPolicy/authenticationMethodConfigurations/voice$') 'voice policy URI'
+Assert ((Get-FirstNetActivation -Current $off -AppId $app -EndpointUrl $url -GroupId $group).Body.'@odata.type' -eq $smsType) 'activation without -Channel is SMS'
+Assert ((Get-FirstNetExpansion -Current $live -Percent 100).'@odata.type' -eq $smsType) 'expansion without -Channel is SMS'
+
+# --- voice: same telecomProviderSettings, voice odata type, voice targets have no isUsableForSignIn
+$a = Get-FirstNetActivation -Channel Voice -Current $off -AppId $app -EndpointUrl $url -GroupId $group
+Assert ($a.Mode -eq 'pilot-group' -and $a.Body.'@odata.type' -eq $voiceType -and $a.Body.state -eq 'enabled') 'voice off: enable it'
+Assert (@($a.Body.includeTargets).Count -eq 1 -and $a.Body.includeTargets[0].id -eq $group -and -not $a.Body.includeTargets[0].ContainsKey('isUsableForSignIn')) 'voice: pilot group target without isUsableForSignIn'
+$p = $a.Body.telecomProviderSettings
+Assert ($p.url -eq $url -and $p.appId -eq $app -and $p.migrationPercentage -eq 100 -and -not $p.isEvaluationModeEnabled) 'voice: FirstNet endpoint, live, 100%'
+Assert ($a.Summary -match 'voice' -and $a.Summary -cnotmatch 'SMS') 'voice summary does not talk about SMS'
+Assert ((Get-FirstNetActivation -Channel Voice -Current $off -AppId $app -EndpointUrl $url -GroupId $group -Evaluate).Body.telecomProviderSettings.isEvaluationModeEnabled) 'voice: -Evaluate sets evaluation mode'
+Assert-Throws { Get-FirstNetActivation -Channel Voice -Current $inUse -AppId $app -EndpointUrl $url -GroupId $group } 'switch voice off for everyone else.*-Percent'
+$a = Get-FirstNetActivation -Channel Voice -Current $inUse -AppId $app -EndpointUrl $url -Percent 5
+Assert ($a.Mode -eq 'existing-targets' -and -not $a.Body.ContainsKey('includeTargets') -and $a.Body.telecomProviderSettings.migrationPercentage -eq 5) 'voice in use: targets untouched, 5%'
+Assert ($a.Summary -match 'voice calls, which it retires on 1 February 2027' -and $a.Summary -cnotmatch 'SMS') 'voice plan names the retirement of Microsoft''s voice calls'
+Assert-Throws { Get-FirstNetActivation -Channel Voice -Current $other -AppId $app -EndpointUrl $url -Percent 5 } '^Voice is already routed to another provider'
+Assert-Throws { Get-FirstNetExpansion -Channel Voice -Current $off -Percent 50 } 'not active for voice.*-Activate -Channel Voice first'
+$e = Get-FirstNetExpansion -Channel Voice -Current $live -Percent 100 -AllUsers
+Assert ($e.'@odata.type' -eq $voiceType -and $e.telecomProviderSettings.migrationPercentage -eq 100 -and -not $e.telecomProviderSettings.isEvaluationModeEnabled) 'voice expand to 100%'
+Assert ($e.includeTargets[0].id -eq 'all_users' -and -not $e.includeTargets[0].ContainsKey('isUsableForSignIn')) 'voice all users target'
+
+# --- voice rollback: the backup says which policy it is
+$voiceBackup = @{
+    '@odata.context' = 'x'; '@odata.type' = $voiceType; id = 'Voice'; state = 'enabled'; isOfficePhoneAllowed = $false
+    includeTargets = @(@{ targetType = 'group'; id = 'all_users'; isRegistrationRequired = $false; '@odata.type' = '#x' })
+    telecomProviderSettings = $null
+}
+Assert ((Get-FirstNetBackupChannel $voiceBackup) -eq 'Voice') 'voice backup detected by odata type'
+Assert ((Get-FirstNetBackupChannel @{ id = 'Voice'; state = 'enabled' }) -eq 'Voice') 'voice backup detected by id'
+$rb = Get-FirstNetRollbackBody $voiceBackup
+Assert ($rb.'@odata.type' -eq $voiceType -and $rb.state -eq 'enabled' -and -not $rb.ContainsKey('isOfficePhoneAllowed')) 'voice rollback body'
+Assert ($rb.includeTargets[0].Keys.Count -eq 3) 'voice rollback keeps only the target''s own fields'
+Assert-Throws { Get-FirstNetBackupChannel @{ '@odata.type' = '#microsoft.graph.fido2AuthenticationMethodConfiguration' } } 'not an SMS or voice policy'
 
 Write-Host 'FirstNet enablement tests passed.' -ForegroundColor Green

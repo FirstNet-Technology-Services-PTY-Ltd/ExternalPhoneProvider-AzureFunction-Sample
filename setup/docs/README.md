@@ -717,6 +717,34 @@ offline tests and an ordinary Azure CLI token do not supply that caller.
 SMS and voice can share the same endpoint URL and application client ID. Setup's handoff lists
 both policy targets; validate and activate only the channels you intend to enable, separately.
 
+<a id="firstnet-enablement-script"></a>
+### FirstNet: `Enable-FirstNetSms.ps1`
+
+For FirstNet customers, [`setup/Enable-FirstNetSms.ps1`](../Enable-FirstNetSms.ps1) performs this
+step. It writes only the fields that Microsoft's Graph beta reference now documents:
+`telecomProviderSettings` (`url`, `appId`, `isEvaluationModeEnabled`, `migrationPercentage`) on
+both the [SMS](https://learn.microsoft.com/en-us/graph/api/resources/smsauthenticationmethodconfiguration?view=graph-rest-beta)
+and [voice](https://learn.microsoft.com/en-us/graph/api/resources/voiceauthenticationmethodconfiguration?view=graph-rest-beta)
+method configurations (see [telecomProviderSettings](https://learn.microsoft.com/en-us/graph/api/resources/telecomprovidersettings?view=graph-rest-beta)).
+It handles one channel per policy, SMS by default:
+
+| Run | Policy changed |
+| --- | --- |
+| `./Enable-FirstNetSms.ps1 -Activate [-Evaluate] [-Percent <n>]` | SMS (`.../authenticationMethodConfigurations/Sms`) |
+| `./Enable-FirstNetSms.ps1 -Activate -Channel Voice [-Evaluate] [-Percent <n>]` | Voice (`.../authenticationMethodConfigurations/voice`) |
+| `./Enable-FirstNetSms.ps1 -Activate -Channel Both ...` | SMS, then voice |
+| `./Enable-FirstNetSms.ps1 -Expand [-Channel Voice\|Both] -Percent 100 [-AllUsers]` | Same choice of channel |
+| `./Enable-FirstNetSms.ps1 -Rollback <backup.json>` | The channel recorded in that backup |
+
+Before each change the script saves the channel's current policy to its own file
+(`sms-policy-backup-*.json` or `voice-policy-backup-*.json`); `-Rollback` restores that policy's
+state, include targets and provider settings. Voice uses the same Function, endpoint URL and
+application ID as SMS, so it needs no second deployment. The script leaves the voice policy's
+`isOfficePhoneAllowed` and `callerIdNumber` unchanged. Microsoft retires its own SMS **and** voice
+delivery on 1 February 2027 (1 July 2027 for Global Administrators and external users), so take
+each channel you keep to 100% before then
+([retirement FAQ](https://learn.microsoft.com/en-us/entra/identity/authentication/concept-sms-voice-retirement-faq)).
+
 **Activation is an assisted, product-specific gate, not an executable public Graph recipe.**
 The public beta [SMS](https://learn.microsoft.com/en-us/graph/api/resources/smsauthenticationmethodconfiguration?view=graph-rest-beta)
 and [Voice](https://learn.microsoft.com/en-us/graph/api/resources/voiceauthenticationmethodconfiguration?view=graph-rest-beta)
